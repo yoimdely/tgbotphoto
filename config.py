@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,4 +34,20 @@ class Settings(BaseSettings):
         return admin_ids
 
 
-settings = Settings()
+def load_settings() -> Settings:
+    """Load settings with a friendly error if mandatory variables are missing."""
+
+    try:
+        return Settings()
+    except ValidationError as exc:  # pragma: no cover - defensive user guidance
+        missing_fields = ", ".join(err["loc"][0] for err in exc.errors())
+        message = (
+            "Не удалось загрузить конфигурацию. "
+            "Проверьте, что в .env указаны обязательные переменные: "
+            f"{missing_fields}.\n"
+            "Создайте файл .env на основе .env.example и задайте BOT_TOKEN."
+        )
+        raise SystemExit(message) from exc
+
+
+settings = load_settings()
