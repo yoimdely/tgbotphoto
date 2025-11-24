@@ -1,15 +1,19 @@
+"""In-memory state storage for users."""
+
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from PIL import Image
 
 
 @dataclass
 class UserHistoryItem:
+    """История обработанного объявления."""
+
     platform: str
     title: str
     processed_at: datetime
@@ -18,6 +22,8 @@ class UserHistoryItem:
 
 @dataclass
 class UserState:
+    """Состояние пользователя."""
+
     last_images: List[Image.Image] = field(default_factory=list)
     last_description: str = ""
     last_title: str = ""
@@ -46,6 +52,7 @@ class StateStorage:
         url: str,
         platform: str,
     ) -> None:
+        """Сохраняет последний результат и пушит запись в историю."""
         async with self._lock:
             state = self._storage.setdefault(user_id, UserState())
             state.last_images = images
@@ -67,6 +74,12 @@ class StateStorage:
     async def get_history(self, user_id: int) -> List[UserHistoryItem]:
         state = await self.get_state(user_id)
         return state.history
+
+    async def get_history_item(self, user_id: int, index: int) -> UserHistoryItem | None:
+        history = await self.get_history(user_id)
+        if 0 <= index < len(history):
+            return history[index]
+        return None
 
     async def get_last_images(self, user_id: int) -> List[Image.Image]:
         state = await self.get_state(user_id)

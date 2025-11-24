@@ -1,32 +1,37 @@
-import os
-from pydantic import BaseSettings, Field
+"""Application configuration loaded from environment variables."""
+
+from __future__ import annotations
+
 from typing import List
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Настройки приложения, загружаемые из переменных окружения."""
+    """Settings for the Telegram bot loaded from ``.env`` file."""
 
-    bot_token: str = Field(..., env="BOT_TOKEN")
-    admin_ids: List[int] = Field(default_factory=list, env="ADMIN_IDS")
+    bot_token: str = Field(..., alias="BOT_TOKEN")
+    admin_ids: List[int] = Field(default_factory=list, alias="ADMIN_IDS")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-
-def _parse_admin_ids(raw: List[int]) -> List[int]:
-    """Преобразует строковый список ID в числовой."""
-    parsed = []
-    for value in raw:
-        if isinstance(value, int):
-            parsed.append(value)
-            continue
-        try:
-            parsed.append(int(value))
-        except (TypeError, ValueError):
-            continue
-    return parsed
+    @field_validator("admin_ids", mode="before")
+    @classmethod
+    def _parse_admin_ids(cls, raw: str | list[int] | None) -> list[int]:
+        """Parse comma-separated or list-based admin ids from env."""
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return [int(item) for item in raw if isinstance(item, (str, int))]
+        values = [part.strip() for part in str(raw).split(",") if part.strip()]
+        admin_ids: list[int] = []
+        for value in values:
+            try:
+                admin_ids.append(int(value))
+            except ValueError:
+                continue
+        return admin_ids
 
 
 settings = Settings()
-settings.admin_ids = _parse_admin_ids(settings.admin_ids)

@@ -1,10 +1,13 @@
+"""Парсеры объявлений для Avito, Циан и Домклик."""
+
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Callable, List
+from typing import Iterable, List
 
 import httpx
 from bs4 import BeautifulSoup
@@ -12,15 +15,22 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 
+USER_AGENT = "Mozilla/5.0 (compatible; TelegramBot/1.0; +https://example.com/bot)"
+MAX_IMAGES = 20
+
+
+class ListingParseError(ValueError):
+    """Исключение, сигнализирующее о неудачной загрузке объявления."""
+
+
 @dataclass
 class ListingData:
+    """Данные объявления."""
+
     title: str
     description: str
     images: List[bytes]
     platform: str
-
-
-USER_AGENT = "Mozilla/5.0 (compatible; TelegramBot/1.0; +https://example.com/bot)"
 
 
 async def fetch_html(url: str) -> str:
@@ -32,6 +42,7 @@ async def fetch_html(url: str) -> str:
 
 
 async def download_image(url: str) -> bytes:
+    """Скачивает изображение по ссылке."""
     async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}, timeout=20) as client:
         response = await client.get(url, follow_redirects=True)
         response.raise_for_status()
@@ -41,87 +52,145 @@ async def download_image(url: str) -> bytes:
 async def parse_listing(url: str) -> ListingData:
     """Определяет площадку и вызывает соответствующий парсер."""
     url = url.strip()
-    if "avito.ru" in url:
-        return await parse_avito(url)
-    if "cian.ru" in url:
-        return await parse_cian(url)
-    if "domclick.ru" in url:
-        return await parse_domclick(url)
-    raise ValueError("Неизвестная площадка. Поддерживаются Avito, Циан и Домклик.")
+    logger.info("Получена ссылка от пользователя: %s", url)
 
+    try:
+        if "avito.ru" in url:
+            return await parse_avito(url)
+        if "cian.ru" in url:
+            return await parse_cian(url)
+        if "domclick.ru" in url:
+            return await parse_domclick(url)
+    except httpx.HTTPError as exc:
+        logger.exception("Ошибка сети при парсинге ссылки")
+        raise ListingParseError("Сайт недоступен. Попробуйте позже.") from exc
+    except asyncio.TimeoutError as exc:
+        logger.exception("Таймаут при парсинге ссылки")
+        raise ListingParseError("Превышено время ожидания ответа сайта.") from exc
+    except ListingParseError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Не удалось обработать объявление")
+        raise ListingParseError("Не удалось получить данные объявления.") from exc
 
-async def _generic_parser(url: str, image_selectors: List[str], title_selector: str | None = None) -> ListingData:
-    html = await fetch_html(url)
-    soup = BeautifulSoup(html, "html.parser")
-
-    title = soup.title.string.strip() if soup.title else "Объявление"
-    if title_selector:
-        found_title = soup.select_one(title_selector)
-        if found_title and found_title.text:
-            title = found_title.text.strip()
-
-    description = ""
-    description_candidates = [
-        soup.find("meta", attrs={"name": "description"}),
-        soup.find("meta", attrs={"property": "og:description"}),
-    ]
-    for candidate in description_candidates:
-        if candidate and candidate.get("content"):
-            description = candidate["content"].strip()
-            break
-
-    image_urls: List[str] = []
-    for selector in image_selectors:
-        for tag in soup.select(selector):
-            if tag.get("content"):
-                image_urls.append(tag["content"])
-            elif tag.get("src"):
-                image_urls.append(tag["src"])
-
-    og_image = soup.find("meta", property="og:image")
-    if og_image and og_image.get("content"):
-        image_urls.append(og_image["content"])
-
-    image_urls = [url for url in image_urls if url.startswith("http")]
-    if not image_urls:
-        raise RuntimeError("Не удалось получить фотографии с этой ссылки. Попробуйте другое объявление или другую площадку.")
-
-    images: List[bytes] = []
-    for img_url in image_urls[:20]:  # ограничиваемся первыми 20 изображениями
-        try:
-            images.append(await download_image(img_url))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Ошибка загрузки изображения %s: %s", img_url, exc)
-
-    if not images:
-        raise RuntimeError("Не удалось скачать изображения с объявления.")
-
-    return ListingData(title=title, description=description, images=images, platform=_detect_platform(url))
-
-
-def _detect_platform(url: str) -> str:
-    if "avito" in url:
-        return "Avito"
-    if "cian" in url:
-        return "Циан"
-    if "domclick" in url:
-        return "Домклик"
-    return "Неизвестно"
+    raise ListingParseError("Неизвестная площадка. Поддерживаются Avito, Циан и Домклик.")
 
 
 async def parse_avito(url: str) -> ListingData:
-    # Avito часто кладёт ссылки в meta og:image и data-url в скриптах.
-    selectors = ["meta[property='og:image']", "img[itemprop='image']"]
-    return await _generic_parser(url, selectors, title_selector="span.title-info-title-text")
+    """Парсинг объявлений Avito."""
+    html = await fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = _extract_title(soup)
+    description = _extract_description(soup)
+    images = await _download_images(_collect_avito_images(html, soup))
+
+    return ListingData(title=title, description=description, images=images, platform="Avito")
 
 
 async def parse_cian(url: str) -> ListingData:
-    # Циан хранит ссылки в meta og:image и теге picture > source.
-    selectors = ["meta[property='og:image']", "picture source"]
-    return await _generic_parser(url, selectors)
+    """Парсинг объявлений Циан."""
+    html = await fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = _extract_title(soup)
+    description = _extract_description(soup)
+    images = await _download_images(_collect_cian_images(html, soup))
+
+    return ListingData(title=title, description=description, images=images, platform="Циан")
 
 
 async def parse_domclick(url: str) -> ListingData:
-    # Домклик использует meta и data-атрибуты.
-    selectors = ["meta[property='og:image']", "img[data-test='gallery-image']"]
-    return await _generic_parser(url, selectors)
+    """Парсинг объявлений Домклик."""
+    html = await fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = _extract_title(soup)
+    description = _extract_description(soup)
+    images = await _download_images(_collect_domclick_images(html, soup))
+
+    return ListingData(title=title, description=description, images=images, platform="Домклик")
+
+
+def _extract_title(soup: BeautifulSoup) -> str:
+    for tag in [
+        soup.find("meta", property="og:title"),
+        soup.find("meta", attrs={"name": "title"}),
+        soup.title,
+    ]:
+        if tag and (content := tag.get("content") or tag.text):
+            return content.strip()
+    return "Объявление"
+
+
+def _extract_description(soup: BeautifulSoup) -> str:
+    for tag in [
+        soup.find("meta", property="og:description"),
+        soup.find("meta", attrs={"name": "description"}),
+    ]:
+        if tag and tag.get("content"):
+            return tag["content"].strip()
+    return "Описание недоступно"
+
+
+def _collect_avito_images(html: str, soup: BeautifulSoup) -> List[str]:
+    matches = re.findall(r"https?://[^\s'\"]*?(?:avito\.st|images\.avito|static-\d+\.avito).*?(?:jpg|jpeg|png)", html)
+    meta_images = [tag["content"] for tag in soup.find_all("meta", property="og:image") if tag.get("content")]
+    return _cleanup_images(matches + meta_images)
+
+
+def _collect_cian_images(html: str, soup: BeautifulSoup) -> List[str]:
+    matches = re.findall(r"https?://[^\s'\"]*?(?:cdn-?cian|cian\.cdn).*?(?:jpg|jpeg|png)", html)
+    picture_sources = [tag.get("srcset") or tag.get("src") for tag in soup.select("picture source, img")]
+    json_images: list[str] = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.text)
+            if isinstance(data, dict) and "image" in data:
+                images = data.get("image")
+                if isinstance(images, list):
+                    json_images.extend([img for img in images if isinstance(img, str)])
+                elif isinstance(images, str):
+                    json_images.append(images)
+        except json.JSONDecodeError:
+            continue
+    return _cleanup_images(matches + picture_sources + json_images)
+
+
+def _collect_domclick_images(html: str, soup: BeautifulSoup) -> List[str]:
+    matches = re.findall(r"https?://[^\s'\"]*?(?:domclick|static\.dc|cdn\.domclick).*?(?:jpg|jpeg|png)", html)
+    data_attrs = [tag.get("src") for tag in soup.select("img[data-test='gallery-image'], img")]  # broader selection
+    return _cleanup_images(matches + data_attrs)
+
+
+def _cleanup_images(urls: Iterable[str | None]) -> List[str]:
+    cleaned = []
+    for url in urls:
+        if not url:
+            continue
+        normalized = url.split("?")[0]
+        if normalized.startswith("http") and normalized not in cleaned:
+            cleaned.append(normalized)
+        if len(cleaned) >= MAX_IMAGES:
+            break
+    if not cleaned:
+        raise ListingParseError(
+            "Не удалось получить фотографии с этой ссылки. Попробуйте другое объявление или другую площадку."
+        )
+    return cleaned
+
+
+async def _download_images(urls: Iterable[str]) -> List[bytes]:
+    tasks = [download_image(url) for url in urls]
+    results: list[bytes] = []
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+    for idx, resp in enumerate(responses):
+        if isinstance(resp, Exception):
+            logger.warning("Ошибка загрузки изображения #%s: %s", idx + 1, resp)
+            continue
+        results.append(resp)
+    if not results:
+        raise ListingParseError(
+            "Не удалось скачать изображения с объявления. Попробуйте позже или другую ссылку."
+        )
+    return results

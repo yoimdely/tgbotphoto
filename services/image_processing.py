@@ -1,18 +1,23 @@
+"""Функции обработки изображений."""
+
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
-from typing import Iterable, List
+from typing import Callable, Iterable, List
 
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 
-try:
+try:  # pragma: no cover - опциональная зависимость
     import cv2
 except Exception:  # noqa: BLE001
     cv2 = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+MAX_SIDE = 2000
 
 
 async def remove_watermark(image: Image.Image) -> Image.Image:
@@ -46,8 +51,8 @@ async def enhance_image(image: Image.Image) -> Image.Image:
 def _enhance_image_sync(image: Image.Image) -> Image.Image:
     enhanced = image.convert("RGB")
     enhanced = enhanced.filter(ImageFilter.SHARPEN)
-    enhanced = ImageEnhance.Contrast(enhanced).enhance(1.1)
-    enhanced = ImageEnhance.Brightness(enhanced).enhance(1.05)
+    enhanced = ImageEnhance.Contrast(enhanced).enhance(1.12)
+    enhanced = ImageEnhance.Brightness(enhanced).enhance(1.06)
     enhanced = enhanced.filter(ImageFilter.SMOOTH)
     return enhanced
 
@@ -57,6 +62,29 @@ async def mirror_image(image: Image.Image) -> Image.Image:
     return await asyncio.to_thread(image.transpose, Image.FLIP_LEFT_RIGHT)
 
 
-async def process_batch(images: Iterable[Image.Image], func) -> List[Image.Image]:
-    tasks = [func(img) for img in images]
-    return await asyncio.gather(*tasks)
+def resize_if_needed(image: Image.Image, max_side: int = MAX_SIDE) -> Image.Image:
+    """Слегка уменьшает изображение по длинной стороне, чтобы не перегружать Telegram."""
+    width, height = image.size
+    longest = max(width, height)
+    if longest <= max_side:
+        return image
+    ratio = max_side / float(longest)
+    new_size = (int(width * ratio), int(height * ratio))
+    resized = image.copy()
+    resized.thumbnail(new_size, Image.Resampling.LANCZOS)
+    return resized
+
+
+async def process_batch(
+    images: Iterable[Image.Image], func: Callable[[Image.Image], Image.Image | asyncio.Future]
+) -> List[Image.Image]:
+    """Применяет функцию к коллекции изображений, поддерживает sync и async функции."""
+
+    tasks: list[asyncio.Future] = []
+    is_async = inspect.iscoroutinefunction(func)
+    for img in images:
+        if is_async:
+            tasks.append(asyncio.ensure_future(func(img)))
+        else:
+            tasks.append(asyncio.to_thread(func, img))
+    return [result for result in await asyncio.gather(*tasks)]  # type: ignore[list-item]
